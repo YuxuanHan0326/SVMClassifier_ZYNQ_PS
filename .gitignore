@@ -1,0 +1,17 @@
+# Ignore everything by default
+*
+
+# Allow directory traversal
+!*/
+
+# Keep only root ignore file
+!/.gitignore
+
+# Keep only key PS-side source files
+!app_component/src/main.c
+!app_component/src/svm_ps_driver.c
+!app_component/src/svm_ps_driver.h
+!app_component/src/mnist_q7_1_data.c
+!app_component/src/mnist_q7_1_data.h
+!app_component/src/CMakeLists.txt
+!app_component/src/UserConfig.cmake
