@@ -23,7 +23,10 @@
 
 #include "xtime_l.h"
 
+/* Match TB acceptance rule: only print/pass by accuracy threshold. */
 #define TB_MIN_ACCURACY 0.98f
+
+/* PMU profiling switches (cfg11 mandatory pass, cfg5/cfg7 optional extra passes). */
 #define ENABLE_PMU_PROFILING 1u
 #define ENABLE_PMU_MULTI_CONFIG 1u
 
@@ -31,6 +34,11 @@ static uint8_t g_pl_predictions[MNIST_NUM_IMAGES] __attribute__((aligned(64)));
 static uint8_t g_cpu_predictions[SVM_CPU_NUM_IMAGES] __attribute__((aligned(64)));
 
 #if ENABLE_PMU_PROFILING
+/*
+ * Run one timed PS profiling pass under a selected PMU event config.
+ * This wraps the same compute function so we can compare event sets
+ * without changing kernel behavior.
+ */
 static int run_cpu_profile_pass(s32 pmu_cfg,
                                 int enable_l2_counter,
                                 s32 l2_event0,
@@ -127,12 +135,14 @@ int main(void) {
     Xil_DCacheEnable();
     Xil_L2CacheEnable();
 
+    /* Phase 1: initialize HW blocks used by PL path (AXI DMA + SVM IP). */
     status = svm_init_hw();
     if (status != XST_SUCCESS) {
         printf("svm_init_hw failed: %d\r\n", status);
         return status;
     }
 
+    /* Phase 2: run PL batch first (serial mode baseline). */
     status = svm_run_batch_timed(g_mnist_test_q7_1,
                                  g_pl_predictions,
                                  (uint16_t)MNIST_NUM_IMAGES,
@@ -143,6 +153,7 @@ int main(void) {
         return status;
     }
 
+    /* Convert cycle counters to microseconds and throughput. */
     pl_kernel_time_us = (pl_kernel_cycles * 1000000ull) / (uint64_t)COUNTS_PER_SECOND;
     pl_dma_time_us = (pl_dma_cycles * 1000000ull) / (uint64_t)COUNTS_PER_SECOND;
     if (pl_dma_cycles != 0u) {
@@ -150,6 +161,7 @@ int main(void) {
                                  (pl_dma_cycles / 2ull)) / pl_dma_cycles;
     }
 
+    /* PL accuracy check against MNIST ground truth (bit0 comparison). */
     status = svm_eval_accuracy_only(g_pl_predictions,
                                     g_mnist_ground_truth,
                                     (uint16_t)MNIST_NUM_IMAGES,
@@ -166,6 +178,7 @@ int main(void) {
     }
     pl_acc_ok = (pl_accuracy >= TB_MIN_ACCURACY) ? 1 : 0;
 
+    /* Phase 3: run PS quantized kernel (with optional PMU profiling passes). */
 #if ENABLE_PMU_PROFILING
     status = run_cpu_profile_pass(XPM_CNTRCFG11,
                                   1,
@@ -217,6 +230,7 @@ int main(void) {
         return status;
     }
 
+    /* Phase 4: PS timing and PMU derived metrics formatting. */
     cpu_time_us = (cpu_cycles * 1000000ull) / (uint64_t)COUNTS_PER_SECOND;
     if (cpu_cycles != 0u) {
         cpu_images_per_s_x1000 = ((uint64_t)SVM_CPU_NUM_IMAGES * (uint64_t)COUNTS_PER_SECOND * 1000ull +
@@ -257,6 +271,7 @@ int main(void) {
 #endif
 #endif
 
+    /* PS accuracy check against model-aligned label table. */
     status = svm_cpu_quantized_eval_accuracy(g_cpu_predictions,
                                              g_svm_cpu_ground_truth,
                                              (uint16_t)SVM_CPU_NUM_IMAGES,
@@ -273,6 +288,7 @@ int main(void) {
     }
     cpu_acc_ok = (cpu_accuracy >= TB_MIN_ACCURACY) ? 1 : 0;
 
+    /* Final report: latency/throughput/accuracy (+ optional PMU diagnostics). */
     printf("TB_IMAGES=%u\r\n", (unsigned)MNIST_NUM_IMAGES);
     printf("PL kernel_cycles=%llu kernel_time_us=%llu\r\n",
            (unsigned long long)pl_kernel_cycles,

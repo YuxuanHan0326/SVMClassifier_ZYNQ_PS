@@ -19,9 +19,16 @@
 #define SVM_IMG_SIZE_BYTES 784u
 #define SVM_DMA_POLL_TIMEOUT 200000000u
 
+/* Single static driver instances used by the app. */
 static XAxiDma g_dma;
 static XSvm_classifier_ip g_svm_ip;
 static int g_is_initialized = 0;
+
+/*
+ * Async batch context:
+ * Stored between async_start() and async_wait() so wait side can validate
+ * the expected buffer/batch and compute cycle deltas.
+ */
 static int g_batch_in_flight = 0;
 static uint8_t *g_async_out_label = NULL;
 static uint16_t g_async_n_images = 0u;
@@ -83,6 +90,7 @@ int svm_run_batch_async_start(const int8_t *in_q7_1,
         return XST_SUCCESS;
     }
 
+    /* Contract: one image = 784 input bytes, one output byte. */
     tx_len = (uint32_t)n_images * SVM_IMG_SIZE_BYTES;
     rx_len = (uint32_t)n_images;
 
@@ -96,8 +104,10 @@ int svm_run_batch_async_start(const int8_t *in_q7_1,
     Xil_DCacheFlushRange((INTPTR)in_q7_1, tx_len);
     Xil_DCacheInvalidateRange((INTPTR)out_label, rx_len);
 
+    /* Program control register before launching stream traffic. */
     XSvm_classifier_ip_Set_n_images(&g_svm_ip, n_images);
 
+    /* Launch RX path first to avoid losing early output beats. */
     status = XAxiDma_SimpleTransfer(&g_dma, (UINTPTR)out_label, rx_len, XAXIDMA_DEVICE_TO_DMA);
     if (status != XST_SUCCESS) {
         return status;
@@ -152,6 +162,13 @@ int svm_run_batch_async_wait(uint8_t *out_label,
     ip_done = 0;
     timeout_cycles = SVM_DMA_POLL_TIMEOUT;
 
+    /*
+     * Poll all three completion conditions:
+     * - MM2S drain
+     * - S2MM receive complete
+     * - IP ap_done
+     * We record individual end timestamps when each event first happens.
+     */
     while (timeout_cycles > 0u) {
         if (!mm2s_done && (XAxiDma_Busy(&g_dma, XAXIDMA_DMA_TO_DEVICE) == 0u)) {
             mm2s_done = 1;
@@ -181,6 +198,7 @@ int svm_run_batch_async_wait(uint8_t *out_label,
     *mm2s_to_s2mm_cycles = (uint64_t)(t_dma_end - g_async_t_dma_start);
     *kernel_apstart_to_done_cycles = (uint64_t)(t_kernel_end - g_async_t_kernel_start);
 
+    /* Make fresh DMA output visible to CPU and normalize to 0/1 label bit. */
     Xil_DCacheInvalidateRange((INTPTR)out_label, g_async_rx_len);
     for (uint32_t i = 0; i < g_async_rx_len; ++i) {
         out_label[i] &= 0x1u;

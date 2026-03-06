@@ -21,3 +21,4 @@
 !app_component/src/CMakeLists.txt
 !app_component/src/UserConfig.cmake
 !app_component/src/app.yaml
+!app_component/src/README.txt

@@ -49,6 +49,17 @@
 _Static_assert(SVM_CPU_IMG_SIZE == MNIST_IMG_SIZE, "SVM_CPU_IMG_SIZE must match MNIST_IMG_SIZE");
 _Static_assert(SVM_CPU_NUM_IMAGES == MNIST_NUM_IMAGES, "SVM_CPU_NUM_IMAGES must match MNIST_NUM_IMAGES");
 
+/*
+ * Quantized kernel overview:
+ * - Input/SV are Q7.1 int8.
+ * - alpha is Q5.3 int8.
+ * - bias is Q1.7 int8.
+ * - score accumulates in Q11 fixed-point domain (score_q2048).
+ * - exp(-d2/gamma) is approximated by a validated 8-bit LUT.
+ *
+ * The implementation keeps frequently reused arrays in contiguous/aligned
+ * buffers, with selected hot buffers optionally placed in OCM.
+ */
 static const uint8_t g_svm_exp_lut_rom[1u << SVM_CPU_EXP_LUT_ADDR_BITS] __attribute__((aligned(64))) = {
     0xFF, 0xF7, 0xEF, 0xE8, 0xE0, 0xD9, 0xD2, 0xCC, 0xC5, 0xBF, 0xB9, 0xB3, 0xAE, 0xA8, 0xA3, 0x9E,
     0x99, 0x94, 0x8F, 0x8B, 0x86, 0x82, 0x7E, 0x7A, 0x76, 0x73, 0x6F, 0x6B, 0x68, 0x65, 0x62, 0x5F,
@@ -1018,6 +1029,13 @@ static inline __attribute__((always_inline)) uint8_t classify_cached_dense_with_
 int svm_cpu_quantized_prepare(void) {
     int32_t bias_q7;
 
+    /*
+     * One-time setup:
+     * 1) Quantize bias / SV / alpha.
+     * 2) Build active-SV working set (alpha != 0).
+     * 3) Precompute remainder bounds for exact early exit.
+     * 4) Cache MNIST test-side norms/sparse metadata for fast repeated runs.
+     */
     if (g_svm_prepared != 0) {
         return XST_SUCCESS;
     }
@@ -1073,7 +1091,11 @@ int svm_cpu_quantized_prepare(void) {
         }
     }
 
-    // Sort active SVs by descending |alpha_q3| to tighten exact early-exit bounds.
+    /*
+     * Sort active SVs to make early-exit tighter on average:
+     * larger contribution terms are consumed earlier so remaining bound
+     * shrinks faster.
+     */
     for (uint32_t i = 0u; (i + 1u) < (uint32_t)g_svm_active_sv_count; ++i) {
         uint32_t best = i;
         const uint16_t best_sv0 = g_svm_active_sv_idx[i];
@@ -1145,6 +1167,11 @@ int svm_cpu_quantized_prepare(void) {
     g_svm_active_sv_sparse_off[g_svm_active_sv_count] = active_sparse_cursor;
 #endif
 
+    /*
+     * Prefix-like tail bounds:
+     * rem_pos/rem_neg at index i represent the max possible positive/negative
+     * contribution from remaining SV terms [i..end), enabling exact pruning.
+     */
     g_svm_rem_pos_q2048[g_svm_active_sv_count] = 0;
     g_svm_rem_neg_q2048[g_svm_active_sv_count] = 0;
     for (int32_t i = (int32_t)g_svm_active_sv_count - 1; i >= 0; --i) {
@@ -1230,6 +1257,7 @@ int __attribute__((hot)) svm_cpu_quantized_run_batch_timed(const int8_t *in_q7_1
         return XST_FAILURE;
     }
 
+    /* Timed window only covers per-image inference loop. */
     XTime_GetTime(&t_start);
 
     for (uint32_t img = 0u; img < (uint32_t)n_images; ++img) {
@@ -1249,6 +1277,10 @@ int __attribute__((hot)) svm_cpu_quantized_run_batch_timed(const int8_t *in_q7_1
 #endif
 
         if (use_cached_test != 0) {
+            /*
+             * Fast path for known MNIST test set:
+             * use cached norm/sparsity/bound metadata precomputed in prepare().
+             */
             const uint32_t dense_base = img * SVM_CPU_IMG_SIZE;
 #if !SVM_CPU_FORCE_DENSE_NEON
             x_dense_q1 = (const int8_t *)__builtin_assume_aligned(&in_q7_1[dense_base], SVM_CPU_CACHELINE_BYTES);
@@ -1324,6 +1356,7 @@ int __attribute__((hot)) svm_cpu_quantized_run_batch_timed(const int8_t *in_q7_1
         }
 #endif
 
+        /* Immediate decision if even the best remaining opposite terms cannot flip sign. */
         if (UNLIKELY((score_q2048 + rem_neg_q2048[0]) > 0)) {
             out_label[img] = 1u;
             continue;
@@ -1351,6 +1384,10 @@ int __attribute__((hot)) svm_cpu_quantized_run_batch_timed(const int8_t *in_q7_1
 #endif
 
             if (dense_pair_fast != 0) {
+                /*
+                 * Main hot path: dense NEON pair/quad dot products plus exact
+                 * early-exit checks after each accumulated SV term.
+                 */
                 uint32_t a = 0u;
                 int terminated = 0;
                 const uint32_t active_count = (uint32_t)g_svm_active_sv_count;
@@ -1472,6 +1509,7 @@ int __attribute__((hot)) svm_cpu_quantized_run_batch_timed(const int8_t *in_q7_1
                     }
                 }
             } else {
+                /* Fallback path (sparse-aware when enabled, otherwise dense scalar/NEON). */
                 for (uint32_t a = 0u; a < (uint32_t)g_svm_active_sv_count; ++a) {
 #if SVM_CPU_ENABLE_KZERO_SKIP
                     if ((has_kzero_mask != 0) && is_kzero_masked(img_kzero_mask, a)) {
@@ -1576,6 +1614,7 @@ int __attribute__((cold)) svm_cpu_quantized_eval_accuracy(const uint8_t *pred,
                                                           uint32_t *mismatches_out) {
     uint32_t correct = 0u;
 
+    /* Accuracy-only metric used by current testbench-style reporting. */
     if ((pred == NULL) || (gt == NULL) || (acc_out == NULL) || (mismatches_out == NULL)) {
         return XST_INVALID_PARAM;
     }
