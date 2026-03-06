@@ -1,98 +1,62 @@
-# SVM Accelerator App (ZedBoard PS + PL)
+# ZedBoard SVM PL/PS Parallel Degradation Experiment
 
-## 1. Overview
-- This project runs MNIST binary SVM classification on both:
-  - PL accelerator IP (`svm_classifier_ip`) through AXI DMA.
-  - PS software kernel (`svm_cpu_quantized_*`).
-- Current default execution order in `app_component/src/main.c`:
-  1. Run PL batch on 2601 images.
-  2. Evaluate PL accuracy.
-  3. Run PS batch on the same 2601 images.
-  4. Evaluate PS accuracy.
-- UART output includes timing, throughput, and accuracy (no confusion matrix).
+## 1. Experiment Goal
+This repository is currently focused on one question:
 
-## 2. Key Files
-- `app_component/src/main.c`
-  - Top-level control flow, timing conversion, accuracy print, optional PMU profiling.
-- `app_component/src/svm_ps_driver.c/.h`
-  - PS-side hardware driver:
-    - DMA + IP init.
-    - Batch launch/wait.
-    - PL timing collection.
-- `app_component/src/svm_cpu_quantized.c/.h`
-  - PS quantized SVM implementation (Q-format + LUT + NEON hot paths).
-- `app_component/src/mnist_q7_1_data.c/.h`
-  - Quantized test images (Q7.1) and ground truth for PL-side evaluation.
-- `app_component/src/svm_cpu_model_data.c/.h`
-  - Model parameters and labels used by the PS quantized kernel.
-- `app_component/src/UserConfig.cmake`
-  - Compiler optimization flags.
-- `app_component/src/lscript.ld`
-  - Linker script (includes OCM placement used by hot buffers).
+**When PL (`svm_classifier_ip + AXI DMA`) and PS (ARM-side quantized SVM) run in parallel, does PL suffer significant performance degradation due to memory arbitration?**
 
-## 3. Runtime Flow (main)
-- Enable caches:
-  - `Xil_ICacheEnable()`
-  - `Xil_DCacheEnable()`
-  - `Xil_L2CacheEnable()`
-- Initialize hardware:
-  - `svm_init_hw()`
-- PL batch run:
-  - `svm_run_batch_timed(...)`
-  - Prints:
-    - `PL kernel_cycles/kernel_time_us`
-    - `PL dma_cycles/dma_time_us/images_per_s`
-    - `PL mismatches/accuracy/acc_ok`
-- PS batch run:
-  - `svm_cpu_quantized_run_batch_timed(...)` directly or via PMU wrapper.
-  - Prints:
-    - `PS_QUANTIZED cycles/time_us/images_per_s`
-    - `PS_QUANTIZED mismatches/accuracy/acc_ok`
-- PMU profiling is controlled by macros in `main.c`:
-  - `ENABLE_PMU_PROFILING`
-  - `ENABLE_PMU_MULTI_CONFIG`
+The code path for this experiment is in:
+- `app_component/src/main.c` (`ENABLE_CONCURRENCY_PROOF_TEST=1`)
+- `app_component/src/svm_ps_driver.c`
+- `app_component/src/svm_cpu_quantized.c`
 
-## 4. Timing Definitions
-- PL kernel time:
-  - `XSvm_classifier_ip_Start()` to `XSvm_classifier_ip_IsDone()==1`.
-- PL DMA time:
-  - MM2S launch to S2MM completion.
-- PS time:
-  - Inside `svm_cpu_quantized_run_batch_timed()`, around the per-image inference loop.
-- Time conversion:
-  - `time_us = cycles * 1e6 / COUNTS_PER_SECOND`.
+## 2. Test Setup
+- Board: ZedBoard (Zynq-7020, Cortex-A9 + PL accelerator)
+- Dataset size: `n_pl=2601`, `n_ps=2601`
+- Repetitions: `30` runs
+- Warmup discarded: first `3` runs
+- Polling frequency for PL async completion latch during PS run: `hook_period=1` (poll every PS image)
 
-## 5. Data / Interface Contract (PL path)
-- Input image size: 784 bytes (28x28).
-- Batch size used in this app: 2601 images.
-- DMA lengths:
-  - TX (MM2S): `784 * n_images` bytes.
-  - RX (S2MM): `n_images` bytes.
-- Output parsing:
-  - Final label uses bit0 (`out_label[i] &= 0x1u`).
+Experiment modes per run:
+1. `PL_ONLY`: PL baseline latency
+2. `PS_ONLY`: PS baseline latency
+3. `PL + CPU_SPIN`: PL with compute-only PS load (low memory traffic)
+4. `PL + CPU_MEM_STRESS`: PL with PS memory-stream pressure
+5. `PL + PS_SVM`: real PL+PS parallel inference
 
-## 6. Build Notes
-- Intended build flow: Vitis embedded flow (`empyro.bat` / IDE build).
-- Local syntax check example:
-  - `arm-none-eabi-gcc -fsyntax-only ... main.c svm_ps_driver.c svm_cpu_quantized.c`
-- If git reports `dubious ownership`, add safe directory:
-  - `git config --global --add safe.directory D:/SVM_Accelerator/SVM_Accelerator_Project`
+## 3. How To Run
+1. Build app:
+```bat
+cmd.exe /C "set CC= && set CXX= && empyro.bat build_app -s d:\SVM_Accelerator\SVM_Accelerator_Project\app_component\src -b d:\SVM_Accelerator\SVM_Accelerator_Project\app_component\build"
+```
+2. Program bitstream/ELF in Vitis and launch on hardware.
+3. Open UART console and capture lines:
+   - `PROOF MEDIAN ...`
+   - `PROOF RATIOS ...`
+   - `PROOF CLAIM ...`
 
-## 7. Typical UART Output (simplified)
-- `TB_IMAGES=2601`
-- `PL kernel_cycles=... kernel_time_us=...`
-- `PL dma_cycles=... dma_time_us=... images_per_s=...`
-- `PL mismatches=... accuracy=... threshold=0.98 acc_ok=...`
-- `PS_QUANTIZED cycles=... time_us=... images_per_s=...`
-- `PS_QUANTIZED mismatches=... accuracy=... threshold=0.98 acc_ok=...`
-- Optional PMU lines when profiling is enabled.
+## 4. Measured Results (Latest Run)
+From UART output:
 
-## 8. Accuracy Target
-- `TB_MIN_ACCURACY` is set to `0.98`.
-- `acc_ok=1` when measured accuracy is `>= 0.98`.
+- `PROOF MEDIAN pl_only_us=5371 ps_only_us=224790 spin_pl_us=5376 mem_pl_us=5392 par_total_us=228820 par_pl_us=5429 par_ps_us=225643`
+- `PROOF RATIOS spin_slowdown=1.001 mem_slowdown=1.004 pl_slowdown=1.011 ps_slowdown=1.004 serial_over_parallel=1.006`
+- `PROOF CLAIM memory_arbiter=0`
+- Accuracy:
+  - `PL`: `12` mismatches, `0.995386`
+  - `PS`: `8` mismatches, `0.996924`
 
-## 9. Notes on Async APIs
-- `svm_ps_driver.c` also provides:
-  - `svm_run_batch_async_start(...)`
-  - `svm_run_batch_async_wait(...)`
-- They are currently not used by default main flow (serial PL -> PS mode), but kept for controlled experiments.
+## 5. Analysis & Conclusion
+Key observations:
+1. `PL_ONLY -> par_pl` changed from `5371 us` to `5429 us` (`+58 us`, about `+1.1%`).
+2. `spin_pl` and `mem_pl` are both close to `pl_only` (`1.001x` and `1.004x`), showing no large PL slowdown under added PS load.
+3. Real parallel run also shows only small PL impact (`pl_slowdown=1.011`), not a significant degradation.
+4. Overall completion time (`par_total`) is still dominated by PS runtime scale (about 225 ms vs PL about 5.4 ms).
+
+Conclusion:
+- **Under this workload and configuration, PL does not exhibit significant performance degradation when running in parallel with PS.**
+- **The experiment does not support a severe memory-arbitration bottleneck on PL claim.**
+- Current result is consistent with mild overhead only, not major contention.
+
+## 6. Notes
+- `PROOF CLAIM memory_arbiter` is an automated heuristic based on relative slowdown between control modes.
+- If future testing needs to amplify contention effects, increase sustained PL workload (for example repeated back-to-back PL batches) and retest with the same method.

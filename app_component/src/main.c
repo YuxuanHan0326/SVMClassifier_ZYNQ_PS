@@ -38,7 +38,9 @@
 #define ENABLE_CONCURRENCY_PROOF_TEST 1u
 #define CONCURRENCY_PROOF_RUNS 30u
 #define CONCURRENCY_PROOF_WARMUP 3u
-#define CONCURRENCY_PROOF_HOOK_PERIOD_IMAGES 8u
+#define CONCURRENCY_PROOF_HOOK_PERIOD_IMAGES 1u
+#define CONCURRENCY_PROOF_PS_IMAGES ((uint16_t)SVM_CPU_NUM_IMAGES)
+#define CONCURRENCY_PROOF_MEM_STRIDE_BYTES 64u
 
 static uint8_t g_pl_predictions[MNIST_NUM_IMAGES] __attribute__((aligned(64)));
 static uint8_t g_cpu_predictions[SVM_CPU_NUM_IMAGES] __attribute__((aligned(64)));
@@ -158,73 +160,197 @@ static void proof_pl_poll_hook(uint32_t img_idx, void *user) {
     }
 }
 
+static volatile uint32_t g_proof_sink = 0u;
+
+static void proof_cpu_spin_for_cycles(uint64_t budget_cycles, proof_poll_ctx_t *poll_ctx) {
+    XTime t0;
+    XTime tnow;
+    uint32_t x = 0x13579BDFu;
+
+    if (budget_cycles == 0u) {
+        return;
+    }
+
+    XTime_GetTime(&t0);
+    tnow = t0;
+    while ((uint64_t)(tnow - t0) < budget_cycles) {
+        if (poll_ctx != NULL) {
+            proof_pl_poll_hook(0u, poll_ctx);
+        }
+        for (uint32_t i = 0u; i < 512u; ++i) {
+            x = (x * 1664525u) + 1013904223u;
+            x ^= (x >> 11);
+            x += 0x9E3779B9u;
+        }
+        XTime_GetTime(&tnow);
+    }
+    if (poll_ctx != NULL) {
+        proof_pl_poll_hook(0u, poll_ctx);
+    }
+
+    g_proof_sink ^= x;
+}
+
+static void proof_cpu_mem_stress_for_cycles(const int8_t *buf,
+                                            uint32_t len_bytes,
+                                            uint64_t budget_cycles,
+                                            proof_poll_ctx_t *poll_ctx) {
+    XTime t0;
+    XTime tnow;
+    volatile uint32_t acc = 0u;
+
+    if ((buf == NULL) || (len_bytes < CONCURRENCY_PROOF_MEM_STRIDE_BYTES) || (budget_cycles == 0u)) {
+        return;
+    }
+
+    XTime_GetTime(&t0);
+    tnow = t0;
+    while ((uint64_t)(tnow - t0) < budget_cycles) {
+        if (poll_ctx != NULL) {
+            proof_pl_poll_hook(0u, poll_ctx);
+        }
+        for (uint32_t i = 0u; i < len_bytes; i += CONCURRENCY_PROOF_MEM_STRIDE_BYTES) {
+            acc += (uint8_t)buf[i];
+        }
+        XTime_GetTime(&tnow);
+    }
+    if (poll_ctx != NULL) {
+        proof_pl_poll_hook(0u, poll_ctx);
+    }
+
+    g_proof_sink ^= (uint32_t)acc;
+}
+
 static int run_concurrency_proof_test(void) {
-    const uint16_t n = (uint16_t)MNIST_NUM_IMAGES;
+    const uint16_t n_pl = (uint16_t)MNIST_NUM_IMAGES;
+    const uint16_t n_ps = CONCURRENCY_PROOF_PS_IMAGES;
     uint64_t pl_only_us[CONCURRENCY_PROOF_RUNS];
     uint64_t ps_only_us[CONCURRENCY_PROOF_RUNS];
+    uint64_t par_spin_pl_us[CONCURRENCY_PROOF_RUNS];
+    uint64_t par_mem_pl_us[CONCURRENCY_PROOF_RUNS];
     uint64_t par_total_us[CONCURRENCY_PROOF_RUNS];
     uint64_t par_pl_us[CONCURRENCY_PROOF_RUNS];
     uint64_t par_ps_us[CONCURRENCY_PROOF_RUNS];
     uint32_t keep_idx = 0u;
     int status;
 
-    printf("CONCURRENCY_PROOF runs=%u warmup=%u hook_period=%u\r\n",
+    if ((n_pl == 0u) || (n_pl > (uint16_t)MNIST_NUM_IMAGES) ||
+        (n_ps == 0u) || (n_ps > (uint16_t)SVM_CPU_NUM_IMAGES)) {
+        return XST_INVALID_PARAM;
+    }
+
+    printf("CONCURRENCY_PROOF runs=%u warmup=%u hook_period=%u n_pl=%u n_ps=%u\r\n",
            (unsigned)CONCURRENCY_PROOF_RUNS,
            (unsigned)CONCURRENCY_PROOF_WARMUP,
-           (unsigned)CONCURRENCY_PROOF_HOOK_PERIOD_IMAGES);
+           (unsigned)CONCURRENCY_PROOF_HOOK_PERIOD_IMAGES,
+           (unsigned)n_pl,
+           (unsigned)n_ps);
 
     for (uint32_t run = 0u; run < CONCURRENCY_PROOF_RUNS; ++run) {
         uint64_t pl_dma_cycles = 0u;
         uint64_t pl_kernel_cycles = 0u;
         uint64_t pl_only_cycles;
         uint64_t ps_only_cycles = 0u;
+        uint64_t par_spin_dma_cycles = 0u;
+        uint64_t par_spin_kernel_cycles = 0u;
+        uint64_t par_mem_dma_cycles = 0u;
+        uint64_t par_mem_kernel_cycles = 0u;
         uint64_t par_dma_cycles = 0u;
         uint64_t par_kernel_cycles = 0u;
         uint64_t par_ps_cycles = 0u;
         uint64_t par_total_cycles = 0u;
+        uint64_t par_spin_pl_cycles = 0u;
+        uint64_t par_mem_pl_cycles = 0u;
         uint64_t par_pl_cycles = 0u;
         XTime t_par_start;
         XTime t_par_end;
-        proof_poll_ctx_t poll_ctx;
+        proof_poll_ctx_t poll_ctx_spin;
+        proof_poll_ctx_t poll_ctx_mem;
+        proof_poll_ctx_t poll_ctx_par;
 
         /* Case A: PL only baseline. */
-        status = svm_run_batch_timed(g_mnist_test_q7_1, g_pl_predictions, n, &pl_dma_cycles, &pl_kernel_cycles);
+        status = svm_run_batch_timed(g_mnist_test_q7_1, g_pl_predictions, n_pl, &pl_dma_cycles, &pl_kernel_cycles);
         if (status != XST_SUCCESS) {
             printf("PROOF FAIL run=%u phase=PL_ONLY status=%d\r\n", (unsigned)run, status);
             return status;
         }
         pl_only_cycles = proof_max_u64(pl_dma_cycles, pl_kernel_cycles);
 
-        /* Case B: PS only baseline. */
+        /* Case B: PS-only baseline. */
         svm_cpu_quantized_set_progress_hook(NULL, NULL, 1u);
-        status = svm_cpu_quantized_run_batch_timed(g_mnist_test_q7_1, g_cpu_predictions, n, &ps_only_cycles);
+        status = svm_cpu_quantized_run_batch_timed(g_mnist_test_q7_1, g_cpu_predictions, n_ps, &ps_only_cycles);
         if (status != XST_SUCCESS) {
             printf("PROOF FAIL run=%u phase=PS_ONLY status=%d\r\n", (unsigned)run, status);
             return status;
         }
 
-        /* Case C: True concurrent launch + PS-side high-frequency PL polling. */
-        poll_ctx.pl_done_cycles = 0u;
-        poll_ctx.pl_done_valid = 0;
+        /*
+         * Case C: PL + CPU compute-only spin for the same wall-time budget as PS_ONLY.
+         * If this barely slows PL, CPU occupancy alone is not the root cause.
+         */
+        poll_ctx_spin.pl_done_cycles = 0u;
+        poll_ctx_spin.pl_done_valid = 0;
+        status = svm_run_batch_async_start(g_mnist_test_q7_1, g_pl_predictions, n_pl);
+        if (status != XST_SUCCESS) {
+            printf("PROOF FAIL run=%u phase=PAR_SPIN_START status=%d\r\n", (unsigned)run, status);
+            return status;
+        }
+        proof_cpu_spin_for_cycles(ps_only_cycles, &poll_ctx_spin);
+        status = svm_run_batch_async_wait(g_pl_predictions, n_pl, &par_spin_dma_cycles, &par_spin_kernel_cycles);
+        if (status != XST_SUCCESS) {
+            printf("PROOF FAIL run=%u phase=PAR_SPIN_WAIT status=%d\r\n", (unsigned)run, status);
+            return status;
+        }
+        par_spin_pl_cycles = (poll_ctx_spin.pl_done_valid != 0)
+                                 ? poll_ctx_spin.pl_done_cycles
+                                 : proof_max_u64(par_spin_dma_cycles, par_spin_kernel_cycles);
+
+        /*
+         * Case D: PL + CPU memory-stream stress with the same wall-time budget.
+         * This is a direct memory-arbitration control.
+         */
+        poll_ctx_mem.pl_done_cycles = 0u;
+        poll_ctx_mem.pl_done_valid = 0;
+        status = svm_run_batch_async_start(g_mnist_test_q7_1, g_pl_predictions, n_pl);
+        if (status != XST_SUCCESS) {
+            printf("PROOF FAIL run=%u phase=PAR_MEM_START status=%d\r\n", (unsigned)run, status);
+            return status;
+        }
+        proof_cpu_mem_stress_for_cycles(g_mnist_test_q7_1,
+                                        (uint32_t)MNIST_INPUT_SIZE_BYTES,
+                                        ps_only_cycles,
+                                        &poll_ctx_mem);
+        status = svm_run_batch_async_wait(g_pl_predictions, n_pl, &par_mem_dma_cycles, &par_mem_kernel_cycles);
+        if (status != XST_SUCCESS) {
+            printf("PROOF FAIL run=%u phase=PAR_MEM_WAIT status=%d\r\n", (unsigned)run, status);
+            return status;
+        }
+        par_mem_pl_cycles = (poll_ctx_mem.pl_done_valid != 0)
+                                ? poll_ctx_mem.pl_done_cycles
+                                : proof_max_u64(par_mem_dma_cycles, par_mem_kernel_cycles);
+
+        /* Case E: PL + real PS SVM inference + high-frequency PL polling. */
+        poll_ctx_par.pl_done_cycles = 0u;
+        poll_ctx_par.pl_done_valid = 0;
         XTime_GetTime(&t_par_start);
-        status = svm_run_batch_async_start(g_mnist_test_q7_1, g_pl_predictions, n);
+        status = svm_run_batch_async_start(g_mnist_test_q7_1, g_pl_predictions, n_pl);
         if (status != XST_SUCCESS) {
             printf("PROOF FAIL run=%u phase=PAR_START status=%d\r\n", (unsigned)run, status);
             return status;
         }
 
-        svm_cpu_quantized_set_progress_hook(proof_pl_poll_hook, &poll_ctx, CONCURRENCY_PROOF_HOOK_PERIOD_IMAGES);
-        status = svm_cpu_quantized_run_batch_timed(g_mnist_test_q7_1, g_cpu_predictions, n, &par_ps_cycles);
+        svm_cpu_quantized_set_progress_hook(proof_pl_poll_hook, &poll_ctx_par, CONCURRENCY_PROOF_HOOK_PERIOD_IMAGES);
+        status = svm_cpu_quantized_run_batch_timed(g_mnist_test_q7_1, g_cpu_predictions, n_ps, &par_ps_cycles);
         svm_cpu_quantized_set_progress_hook(NULL, NULL, 1u);
         if (status != XST_SUCCESS) {
             uint64_t drain_dma = 0u;
             uint64_t drain_kernel = 0u;
-            (void)svm_run_batch_async_wait(g_pl_predictions, n, &drain_dma, &drain_kernel);
+            (void)svm_run_batch_async_wait(g_pl_predictions, n_pl, &drain_dma, &drain_kernel);
             printf("PROOF FAIL run=%u phase=PAR_PS status=%d\r\n", (unsigned)run, status);
             return status;
         }
 
-        status = svm_run_batch_async_wait(g_pl_predictions, n, &par_dma_cycles, &par_kernel_cycles);
+        status = svm_run_batch_async_wait(g_pl_predictions, n_pl, &par_dma_cycles, &par_kernel_cycles);
         if (status != XST_SUCCESS) {
             printf("PROOF FAIL run=%u phase=PAR_WAIT status=%d\r\n", (unsigned)run, status);
             return status;
@@ -232,27 +358,32 @@ static int run_concurrency_proof_test(void) {
         XTime_GetTime(&t_par_end);
 
         par_total_cycles = (uint64_t)(t_par_end - t_par_start);
-        par_pl_cycles = (poll_ctx.pl_done_valid != 0)
-                            ? poll_ctx.pl_done_cycles
+        par_pl_cycles = (poll_ctx_par.pl_done_valid != 0)
+                            ? poll_ctx_par.pl_done_cycles
                             : proof_max_u64(par_dma_cycles, par_kernel_cycles);
 
         if (run >= CONCURRENCY_PROOF_WARMUP) {
             pl_only_us[keep_idx] = proof_cycles_to_us(pl_only_cycles);
             ps_only_us[keep_idx] = proof_cycles_to_us(ps_only_cycles);
+            par_spin_pl_us[keep_idx] = proof_cycles_to_us(par_spin_pl_cycles);
+            par_mem_pl_us[keep_idx] = proof_cycles_to_us(par_mem_pl_cycles);
             par_total_us[keep_idx] = proof_cycles_to_us(par_total_cycles);
             par_pl_us[keep_idx] = proof_cycles_to_us(par_pl_cycles);
             par_ps_us[keep_idx] = proof_cycles_to_us(par_ps_cycles);
             ++keep_idx;
         }
 
-        printf("PROOF run=%u pl_only_us=%llu ps_only_us=%llu par_total_us=%llu par_pl_us=%llu par_ps_us=%llu latch=%u\r\n",
+        printf("PROOF run=%u pl_only_us=%llu ps_only_us=%llu spin_pl_us=%llu mem_pl_us=%llu par_total_us=%llu par_pl_us=%llu par_ps_us=%llu ps_earlier=%u latch=%u\r\n",
                (unsigned)run,
                (unsigned long long)proof_cycles_to_us(pl_only_cycles),
                (unsigned long long)proof_cycles_to_us(ps_only_cycles),
+               (unsigned long long)proof_cycles_to_us(par_spin_pl_cycles),
+               (unsigned long long)proof_cycles_to_us(par_mem_pl_cycles),
                (unsigned long long)proof_cycles_to_us(par_total_cycles),
                (unsigned long long)proof_cycles_to_us(par_pl_cycles),
                (unsigned long long)proof_cycles_to_us(par_ps_cycles),
-               (unsigned)((poll_ctx.pl_done_valid != 0) ? 1u : 0u));
+               (unsigned)((par_ps_cycles < par_pl_cycles) ? 1u : 0u),
+               (unsigned)((poll_ctx_par.pl_done_valid != 0) ? 1u : 0u));
     }
 
     if (keep_idx == 0u) {
@@ -262,35 +393,55 @@ static int run_concurrency_proof_test(void) {
     {
         const uint64_t med_pl_only_us = proof_median_u64(pl_only_us, keep_idx);
         const uint64_t med_ps_only_us = proof_median_u64(ps_only_us, keep_idx);
+        const uint64_t med_spin_pl_us = proof_median_u64(par_spin_pl_us, keep_idx);
+        const uint64_t med_mem_pl_us = proof_median_u64(par_mem_pl_us, keep_idx);
         const uint64_t med_par_total_us = proof_median_u64(par_total_us, keep_idx);
         const uint64_t med_par_pl_us = proof_median_u64(par_pl_us, keep_idx);
         const uint64_t med_par_ps_us = proof_median_u64(par_ps_us, keep_idx);
+        const uint64_t spin_slowdown_x1000 = (med_pl_only_us != 0u) ? ((med_spin_pl_us * 1000ull + (med_pl_only_us / 2ull)) / med_pl_only_us) : 0u;
+        const uint64_t mem_slowdown_x1000 = (med_pl_only_us != 0u) ? ((med_mem_pl_us * 1000ull + (med_pl_only_us / 2ull)) / med_pl_only_us) : 0u;
         const uint64_t pl_slowdown_x1000 = (med_pl_only_us != 0u) ? ((med_par_pl_us * 1000ull + (med_pl_only_us / 2ull)) / med_pl_only_us) : 0u;
         const uint64_t ps_slowdown_x1000 = (med_ps_only_us != 0u) ? ((med_par_ps_us * 1000ull + (med_ps_only_us / 2ull)) / med_ps_only_us) : 0u;
         const uint64_t serial_sum_us = med_pl_only_us + med_ps_only_us;
         const uint64_t parallel_gain_x1000 = (med_par_total_us != 0u) ? ((serial_sum_us * 1000ull + (med_par_total_us / 2ull)) / med_par_total_us) : 0u;
+        const int mem_arbiter_claim =
+            ((mem_slowdown_x1000 > (spin_slowdown_x1000 + 100ull)) &&
+             (pl_slowdown_x1000 > (spin_slowdown_x1000 + 100ull)))
+                ? 1
+                : 0;
         float pl_acc = 0.0f;
         float ps_acc = 0.0f;
         uint32_t pl_mis = 0u;
         uint32_t ps_mis = 0u;
 
-        (void)svm_eval_accuracy_only(g_pl_predictions, g_mnist_ground_truth, n, &pl_acc, &pl_mis);
-        (void)svm_cpu_quantized_eval_accuracy(g_cpu_predictions, g_svm_cpu_ground_truth, n, &ps_acc, &ps_mis);
+        (void)svm_eval_accuracy_only(g_pl_predictions, g_mnist_ground_truth, n_pl, &pl_acc, &pl_mis);
+        (void)svm_cpu_quantized_eval_accuracy(g_cpu_predictions, g_svm_cpu_ground_truth, n_ps, &ps_acc, &ps_mis);
 
-        printf("PROOF MEDIAN pl_only_us=%llu ps_only_us=%llu par_total_us=%llu par_pl_us=%llu par_ps_us=%llu\r\n",
+        printf("PROOF MEDIAN pl_only_us=%llu ps_only_us=%llu spin_pl_us=%llu mem_pl_us=%llu par_total_us=%llu par_pl_us=%llu par_ps_us=%llu\r\n",
                (unsigned long long)med_pl_only_us,
                (unsigned long long)med_ps_only_us,
+               (unsigned long long)med_spin_pl_us,
+               (unsigned long long)med_mem_pl_us,
                (unsigned long long)med_par_total_us,
                (unsigned long long)med_par_pl_us,
                (unsigned long long)med_par_ps_us);
-        printf("PROOF RATIOS pl_slowdown=%llu.%03llu ps_slowdown=%llu.%03llu serial_over_parallel=%llu.%03llu\r\n",
+        printf("PROOF RATIOS spin_slowdown=%llu.%03llu mem_slowdown=%llu.%03llu pl_slowdown=%llu.%03llu ps_slowdown=%llu.%03llu serial_over_parallel=%llu.%03llu\r\n",
+               (unsigned long long)(spin_slowdown_x1000 / 1000ull),
+               (unsigned long long)(spin_slowdown_x1000 % 1000ull),
+               (unsigned long long)(mem_slowdown_x1000 / 1000ull),
+               (unsigned long long)(mem_slowdown_x1000 % 1000ull),
                (unsigned long long)(pl_slowdown_x1000 / 1000ull),
                (unsigned long long)(pl_slowdown_x1000 % 1000ull),
                (unsigned long long)(ps_slowdown_x1000 / 1000ull),
                (unsigned long long)(ps_slowdown_x1000 % 1000ull),
                (unsigned long long)(parallel_gain_x1000 / 1000ull),
                (unsigned long long)(parallel_gain_x1000 % 1000ull));
-        printf("PROOF ACC pl_mis=%u pl_acc=%u.%06u ps_mis=%u ps_acc=%u.%06u\r\n",
+        printf("PROOF CLAIM memory_arbiter=%d sink=%u\r\n",
+               mem_arbiter_claim,
+               (unsigned)g_proof_sink);
+        printf("PROOF ACC n_pl=%u n_ps=%u pl_mis=%u pl_acc=%u.%06u ps_mis=%u ps_acc=%u.%06u\r\n",
+               (unsigned)n_pl,
+               (unsigned)n_ps,
                (unsigned)pl_mis,
                (unsigned)((uint32_t)(pl_acc * 1000000.0f + 0.5f) / 1000000u),
                (unsigned)((uint32_t)(pl_acc * 1000000.0f + 0.5f) % 1000000u),
