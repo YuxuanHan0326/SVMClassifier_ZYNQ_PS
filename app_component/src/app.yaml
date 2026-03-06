@@ -1,0 +1,4 @@
+domain_path: D:\SVM_Accelerator\SVM_Accelerator_Project\platform\export\platform\sw\standalone_ps7_cortexa9_0
+app_src_dir: D:\Apps\Xilinx\2025.2\Vitis\data\embeddedsw\lib\sw_apps\empty_application
+template: empty_application
+lang: c

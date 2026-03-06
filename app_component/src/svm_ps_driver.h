@@ -5,6 +5,15 @@
 
 int svm_init_hw(void);
 
+int svm_run_batch_async_start(const int8_t *in_q7_1,
+                              uint8_t *out_label,
+                              uint16_t n_images);
+
+int svm_run_batch_async_wait(uint8_t *out_label,
+                             uint16_t n_images,
+                             uint64_t *mm2s_to_s2mm_cycles,
+                             uint64_t *kernel_apstart_to_done_cycles);
+
 int svm_run_batch_timed(const int8_t *in_q7_1,
                         uint8_t *out_label,
                         uint16_t n_images,

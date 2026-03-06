@@ -74,7 +74,7 @@ set(USER_COMPILE_WARNINGS_INHIBIT_ALL )
 # -----------------------------------------
 
 # Optimization level   "-O0" [None], "-O1" [Optimize] , "-O2" [Optimize More], "-O3" [Optimize Most] or "-Os" [Optimize Size]
-set(USER_COMPILE_OPTIMIZATION_LEVEL -O0)
+set(USER_COMPILE_OPTIMIZATION_LEVEL -O3)
 
 # Other flags related to optimization
 set(USER_COMPILE_OPTIMIZATION_OTHER_FLAGS )
@@ -82,7 +82,7 @@ set(USER_COMPILE_OPTIMIZATION_OTHER_FLAGS )
 # -----------------------------------------
 
 # Debug level "" [None], "-g1" [Minimum], "g2" [Default], "g3" [Maximum]
-set(USER_COMPILE_DEBUG_LEVEL -g3)
+set(USER_COMPILE_DEBUG_LEVEL -g0)
 
 # Other flags related to debugging
 set(USER_COMPILE_DEBUG_OTHER_FLAGS )
@@ -103,7 +103,7 @@ set(USER_COMPILE_RELAXATION "-Wl,--no-relax")
 set(USER_COMPILE_GARBAGE "")
 # Add any compiler options that are not covered by the above variables, they will be added as extra compiler options
 # To enable profiling -pg [ for gprof ]  or -p [ for prof information ]
-set(USER_COMPILE_OTHER_FLAGS )
+set(USER_COMPILE_OTHER_FLAGS "-ffast-math -fno-math-errno -funroll-loops -mfpu=neon -ftree-vectorize -falign-loops=16 -falign-functions=16 -fomit-frame-pointer")
 
 # -----------------------------------------
 
@@ -127,6 +127,7 @@ set(USER_LINK_OMIT_ALL_SYMBOL_INFO )
 # Add any libraries to be linked below, they will be added as extra libraries.
 # User needs to update USER_LINK_DIRECTORIES below with these library search paths.
 set(USER_LINK_LIBRARIES
+"m"
 )
 
 # Add any directories to look for the libraries to be linked.

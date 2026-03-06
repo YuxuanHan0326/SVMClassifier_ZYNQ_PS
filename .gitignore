@@ -7,11 +7,17 @@
 # Keep only root ignore file
 !/.gitignore
 
-# Keep only key PS-side source files
+# Keep only key app source/config files
 !app_component/src/main.c
+!app_component/src/svm_cpu_quantized.c
+!app_component/src/svm_cpu_quantized.h
+!app_component/src/svm_cpu_model_data.c
+!app_component/src/svm_cpu_model_data.h
 !app_component/src/svm_ps_driver.c
 !app_component/src/svm_ps_driver.h
 !app_component/src/mnist_q7_1_data.c
 !app_component/src/mnist_q7_1_data.h
+!app_component/src/lscript.ld
 !app_component/src/CMakeLists.txt
 !app_component/src/UserConfig.cmake
+!app_component/src/app.yaml

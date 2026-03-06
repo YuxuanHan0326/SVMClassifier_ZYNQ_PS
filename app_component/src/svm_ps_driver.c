@@ -22,6 +22,12 @@
 static XAxiDma g_dma;
 static XSvm_classifier_ip g_svm_ip;
 static int g_is_initialized = 0;
+static int g_batch_in_flight = 0;
+static uint8_t *g_async_out_label = NULL;
+static uint16_t g_async_n_images = 0u;
+static uint32_t g_async_rx_len = 0u;
+static XTime g_async_t_dma_start = 0;
+static XTime g_async_t_kernel_start = 0;
 
 int svm_init_hw(void) {
     int status;
@@ -51,25 +57,14 @@ int svm_init_hw(void) {
     return XST_SUCCESS;
 }
 
-int svm_run_batch_timed(const int8_t *in_q7_1,
-                        uint8_t *out_label,
-                        uint16_t n_images,
-                        uint64_t *mm2s_to_s2mm_cycles,
-                        uint64_t *kernel_apstart_to_done_cycles) {
+int svm_run_batch_async_start(const int8_t *in_q7_1,
+                              uint8_t *out_label,
+                              uint16_t n_images) {
     int status;
     uint32_t tx_len;
     uint32_t rx_len;
-    uint32_t timeout_cycles;
-    int mm2s_done;
-    int s2mm_done;
-    int ip_done;
-    XTime t_dma_start;
-    XTime t_dma_end;
-    XTime t_kernel_start;
-    XTime t_kernel_end;
 
-    if ((in_q7_1 == NULL) || (out_label == NULL) ||
-        (mm2s_to_s2mm_cycles == NULL) || (kernel_apstart_to_done_cycles == NULL)) {
+    if ((in_q7_1 == NULL) || (out_label == NULL)) {
         return XST_INVALID_PARAM;
     }
 
@@ -80,16 +75,16 @@ int svm_run_batch_timed(const int8_t *in_q7_1,
         }
     }
 
+    if (g_batch_in_flight != 0) {
+        return XST_DEVICE_BUSY;
+    }
+
     if (n_images == 0u) {
-        *mm2s_to_s2mm_cycles = 0u;
-        *kernel_apstart_to_done_cycles = 0u;
         return XST_SUCCESS;
     }
 
     tx_len = (uint32_t)n_images * SVM_IMG_SIZE_BYTES;
     rx_len = (uint32_t)n_images;
-    *mm2s_to_s2mm_cycles = 0u;
-    *kernel_apstart_to_done_cycles = 0u;
 
     if (tx_len > g_dma.TxBdRing.MaxTransferLen) {
         return XST_INVALID_PARAM;
@@ -108,15 +103,49 @@ int svm_run_batch_timed(const int8_t *in_q7_1,
         return status;
     }
 
-    XTime_GetTime(&t_dma_start);
+    XTime_GetTime(&g_async_t_dma_start);
     status = XAxiDma_SimpleTransfer(&g_dma, (UINTPTR)in_q7_1, tx_len, XAXIDMA_DMA_TO_DEVICE);
     if (status != XST_SUCCESS) {
         return status;
     }
 
-    // Try start order: MM2S first, then ap_start.
     XSvm_classifier_ip_Start(&g_svm_ip);
-    XTime_GetTime(&t_kernel_start);
+    XTime_GetTime(&g_async_t_kernel_start);
+
+    g_batch_in_flight = 1;
+    g_async_out_label = out_label;
+    g_async_n_images = n_images;
+    g_async_rx_len = rx_len;
+    return XST_SUCCESS;
+}
+
+int svm_run_batch_async_wait(uint8_t *out_label,
+                             uint16_t n_images,
+                             uint64_t *mm2s_to_s2mm_cycles,
+                             uint64_t *kernel_apstart_to_done_cycles) {
+    uint32_t timeout_cycles;
+    int mm2s_done;
+    int s2mm_done;
+    int ip_done;
+    XTime t_dma_end;
+    XTime t_kernel_end;
+
+    if ((out_label == NULL) || (mm2s_to_s2mm_cycles == NULL) || (kernel_apstart_to_done_cycles == NULL)) {
+        return XST_INVALID_PARAM;
+    }
+
+    if (n_images == 0u) {
+        *mm2s_to_s2mm_cycles = 0u;
+        *kernel_apstart_to_done_cycles = 0u;
+        return XST_SUCCESS;
+    }
+
+    if (g_batch_in_flight == 0) {
+        return XST_FAILURE;
+    }
+    if ((out_label != g_async_out_label) || (n_images != g_async_n_images)) {
+        return XST_INVALID_PARAM;
+    }
 
     mm2s_done = 0;
     s2mm_done = 0;
@@ -145,18 +174,45 @@ int svm_run_batch_timed(const int8_t *in_q7_1,
     }
 
     if (!(mm2s_done && s2mm_done && ip_done)) {
+        g_batch_in_flight = 0;
         return XST_FAILURE;
     }
 
-    *mm2s_to_s2mm_cycles = (uint64_t)(t_dma_end - t_dma_start);
-    *kernel_apstart_to_done_cycles = (uint64_t)(t_kernel_end - t_kernel_start);
+    *mm2s_to_s2mm_cycles = (uint64_t)(t_dma_end - g_async_t_dma_start);
+    *kernel_apstart_to_done_cycles = (uint64_t)(t_kernel_end - g_async_t_kernel_start);
 
-    Xil_DCacheInvalidateRange((INTPTR)out_label, rx_len);
-    for (uint32_t i = 0; i < rx_len; ++i) {
+    Xil_DCacheInvalidateRange((INTPTR)out_label, g_async_rx_len);
+    for (uint32_t i = 0; i < g_async_rx_len; ++i) {
         out_label[i] &= 0x1u;
     }
 
+    g_batch_in_flight = 0;
+    g_async_out_label = NULL;
+    g_async_n_images = 0u;
+    g_async_rx_len = 0u;
     return XST_SUCCESS;
+}
+
+int svm_run_batch_timed(const int8_t *in_q7_1,
+                        uint8_t *out_label,
+                        uint16_t n_images,
+                        uint64_t *mm2s_to_s2mm_cycles,
+                        uint64_t *kernel_apstart_to_done_cycles) {
+    int status;
+
+    if ((in_q7_1 == NULL) || (out_label == NULL) ||
+        (mm2s_to_s2mm_cycles == NULL) || (kernel_apstart_to_done_cycles == NULL)) {
+        return XST_INVALID_PARAM;
+    }
+
+    *mm2s_to_s2mm_cycles = 0u;
+    *kernel_apstart_to_done_cycles = 0u;
+
+    status = svm_run_batch_async_start(in_q7_1, out_label, n_images);
+    if (status != XST_SUCCESS) {
+        return status;
+    }
+    return svm_run_batch_async_wait(out_label, n_images, mm2s_to_s2mm_cycles, kernel_apstart_to_done_cycles);
 }
 
 int svm_eval_accuracy_only(const uint8_t *pred,
