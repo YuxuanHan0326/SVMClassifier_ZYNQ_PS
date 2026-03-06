@@ -35,6 +35,11 @@ static uint16_t g_async_n_images = 0u;
 static uint32_t g_async_rx_len = 0u;
 static XTime g_async_t_dma_start = 0;
 static XTime g_async_t_kernel_start = 0;
+static int g_async_mm2s_done = 0;
+static int g_async_s2mm_done = 0;
+static int g_async_ip_done = 0;
+static XTime g_async_t_dma_end = 0;
+static XTime g_async_t_kernel_end = 0;
 
 int svm_init_hw(void) {
     int status;
@@ -126,6 +131,40 @@ int svm_run_batch_async_start(const int8_t *in_q7_1,
     g_async_out_label = out_label;
     g_async_n_images = n_images;
     g_async_rx_len = rx_len;
+    g_async_mm2s_done = 0;
+    g_async_s2mm_done = 0;
+    g_async_ip_done = 0;
+    g_async_t_dma_end = 0;
+    g_async_t_kernel_end = 0;
+    return XST_SUCCESS;
+}
+
+int svm_run_batch_async_poll(svm_pl_async_status_t *status) {
+    if (status == NULL) {
+        return XST_INVALID_PARAM;
+    }
+    if (g_batch_in_flight == 0) {
+        return XST_FAILURE;
+    }
+
+    if (!g_async_mm2s_done && (XAxiDma_Busy(&g_dma, XAXIDMA_DMA_TO_DEVICE) == 0u)) {
+        g_async_mm2s_done = 1;
+    }
+    if (!g_async_s2mm_done && (XAxiDma_Busy(&g_dma, XAXIDMA_DEVICE_TO_DMA) == 0u)) {
+        g_async_s2mm_done = 1;
+        XTime_GetTime(&g_async_t_dma_end);
+    }
+    if (!g_async_ip_done && (XSvm_classifier_ip_IsDone(&g_svm_ip) != 0u)) {
+        g_async_ip_done = 1;
+        XTime_GetTime(&g_async_t_kernel_end);
+    }
+
+    status->mm2s_done = (uint8_t)((g_async_mm2s_done != 0) ? 1u : 0u);
+    status->s2mm_done = (uint8_t)((g_async_s2mm_done != 0) ? 1u : 0u);
+    status->ip_done = (uint8_t)((g_async_ip_done != 0) ? 1u : 0u);
+    status->all_done = (uint8_t)(((g_async_mm2s_done != 0) && (g_async_s2mm_done != 0) && (g_async_ip_done != 0)) ? 1u : 0u);
+    status->dma_cycles = (g_async_s2mm_done != 0) ? (uint64_t)(g_async_t_dma_end - g_async_t_dma_start) : 0u;
+    status->kernel_cycles = (g_async_ip_done != 0) ? (uint64_t)(g_async_t_kernel_end - g_async_t_kernel_start) : 0u;
     return XST_SUCCESS;
 }
 
@@ -134,11 +173,7 @@ int svm_run_batch_async_wait(uint8_t *out_label,
                              uint64_t *mm2s_to_s2mm_cycles,
                              uint64_t *kernel_apstart_to_done_cycles) {
     uint32_t timeout_cycles;
-    int mm2s_done;
-    int s2mm_done;
-    int ip_done;
-    XTime t_dma_end;
-    XTime t_kernel_end;
+    svm_pl_async_status_t st;
 
     if ((out_label == NULL) || (mm2s_to_s2mm_cycles == NULL) || (kernel_apstart_to_done_cycles == NULL)) {
         return XST_INVALID_PARAM;
@@ -157,10 +192,10 @@ int svm_run_batch_async_wait(uint8_t *out_label,
         return XST_INVALID_PARAM;
     }
 
-    mm2s_done = 0;
-    s2mm_done = 0;
-    ip_done = 0;
     timeout_cycles = SVM_DMA_POLL_TIMEOUT;
+    st.all_done = 0u;
+    st.dma_cycles = 0u;
+    st.kernel_cycles = 0u;
 
     /*
      * Poll all three completion conditions:
@@ -170,33 +205,22 @@ int svm_run_batch_async_wait(uint8_t *out_label,
      * We record individual end timestamps when each event first happens.
      */
     while (timeout_cycles > 0u) {
-        if (!mm2s_done && (XAxiDma_Busy(&g_dma, XAXIDMA_DMA_TO_DEVICE) == 0u)) {
-            mm2s_done = 1;
+        if (svm_run_batch_async_poll(&st) != XST_SUCCESS) {
+            break;
         }
-
-        if (!s2mm_done && (XAxiDma_Busy(&g_dma, XAXIDMA_DEVICE_TO_DMA) == 0u)) {
-            s2mm_done = 1;
-            XTime_GetTime(&t_dma_end);
-        }
-
-        if (!ip_done && (XSvm_classifier_ip_IsDone(&g_svm_ip) != 0u)) {
-            ip_done = 1;
-            XTime_GetTime(&t_kernel_end);
-        }
-
-        if (mm2s_done && s2mm_done && ip_done) {
+        if (st.all_done != 0u) {
             break;
         }
         timeout_cycles--;
     }
 
-    if (!(mm2s_done && s2mm_done && ip_done)) {
+    if ((st.all_done == 0u) || (timeout_cycles == 0u)) {
         g_batch_in_flight = 0;
         return XST_FAILURE;
     }
 
-    *mm2s_to_s2mm_cycles = (uint64_t)(t_dma_end - g_async_t_dma_start);
-    *kernel_apstart_to_done_cycles = (uint64_t)(t_kernel_end - g_async_t_kernel_start);
+    *mm2s_to_s2mm_cycles = st.dma_cycles;
+    *kernel_apstart_to_done_cycles = st.kernel_cycles;
 
     /* Make fresh DMA output visible to CPU and normalize to 0/1 label bit. */
     Xil_DCacheInvalidateRange((INTPTR)out_label, g_async_rx_len);
@@ -208,6 +232,11 @@ int svm_run_batch_async_wait(uint8_t *out_label,
     g_async_out_label = NULL;
     g_async_n_images = 0u;
     g_async_rx_len = 0u;
+    g_async_mm2s_done = 0;
+    g_async_s2mm_done = 0;
+    g_async_ip_done = 0;
+    g_async_t_dma_end = 0;
+    g_async_t_kernel_end = 0;
     return XST_SUCCESS;
 }
 

@@ -30,6 +30,16 @@
 #define ENABLE_PMU_PROFILING 1u
 #define ENABLE_PMU_MULTI_CONFIG 1u
 
+/*
+ * Concurrency proof mode:
+ * Runs PL_ONLY / PS_ONLY / PARALLEL sweeps repeatedly and reports medians.
+ * Uses high-frequency async polling hook while PS is running.
+ */
+#define ENABLE_CONCURRENCY_PROOF_TEST 1u
+#define CONCURRENCY_PROOF_RUNS 30u
+#define CONCURRENCY_PROOF_WARMUP 3u
+#define CONCURRENCY_PROOF_HOOK_PERIOD_IMAGES 8u
+
 static uint8_t g_pl_predictions[MNIST_NUM_IMAGES] __attribute__((aligned(64)));
 static uint8_t g_cpu_predictions[SVM_CPU_NUM_IMAGES] __attribute__((aligned(64)));
 
@@ -90,6 +100,209 @@ static int run_cpu_profile_pass(s32 pmu_cfg,
 }
 #endif
 
+#if ENABLE_CONCURRENCY_PROOF_TEST
+typedef struct {
+    uint64_t pl_done_cycles;
+    int pl_done_valid;
+} proof_poll_ctx_t;
+
+static inline uint64_t proof_max_u64(uint64_t a, uint64_t b) {
+    return (a > b) ? a : b;
+}
+
+static inline uint64_t proof_cycles_to_us(uint64_t cycles) {
+    return (cycles * 1000000ull) / (uint64_t)COUNTS_PER_SECOND;
+}
+
+static void proof_sort_u64(uint64_t *arr, uint32_t n) {
+    for (uint32_t i = 1u; i < n; ++i) {
+        uint64_t key = arr[i];
+        uint32_t j = i;
+        while ((j > 0u) && (arr[j - 1u] > key)) {
+            arr[j] = arr[j - 1u];
+            --j;
+        }
+        arr[j] = key;
+    }
+}
+
+static uint64_t proof_median_u64(const uint64_t *arr, uint32_t n) {
+    uint64_t tmp[CONCURRENCY_PROOF_RUNS];
+    if ((arr == NULL) || (n == 0u) || (n > CONCURRENCY_PROOF_RUNS)) {
+        return 0u;
+    }
+    for (uint32_t i = 0u; i < n; ++i) {
+        tmp[i] = arr[i];
+    }
+    proof_sort_u64(tmp, n);
+    if ((n & 1u) != 0u) {
+        return tmp[n / 2u];
+    }
+    return (tmp[(n / 2u) - 1u] + tmp[n / 2u]) / 2u;
+}
+
+static void proof_pl_poll_hook(uint32_t img_idx, void *user) {
+    proof_poll_ctx_t *ctx = (proof_poll_ctx_t *)user;
+    svm_pl_async_status_t st;
+    (void)img_idx;
+
+    if ((ctx == NULL) || (ctx->pl_done_valid != 0)) {
+        return;
+    }
+    if (svm_run_batch_async_poll(&st) != XST_SUCCESS) {
+        return;
+    }
+    if ((st.s2mm_done != 0u) && (st.ip_done != 0u)) {
+        ctx->pl_done_cycles = proof_max_u64(st.dma_cycles, st.kernel_cycles);
+        ctx->pl_done_valid = 1;
+    }
+}
+
+static int run_concurrency_proof_test(void) {
+    const uint16_t n = (uint16_t)MNIST_NUM_IMAGES;
+    uint64_t pl_only_us[CONCURRENCY_PROOF_RUNS];
+    uint64_t ps_only_us[CONCURRENCY_PROOF_RUNS];
+    uint64_t par_total_us[CONCURRENCY_PROOF_RUNS];
+    uint64_t par_pl_us[CONCURRENCY_PROOF_RUNS];
+    uint64_t par_ps_us[CONCURRENCY_PROOF_RUNS];
+    uint32_t keep_idx = 0u;
+    int status;
+
+    printf("CONCURRENCY_PROOF runs=%u warmup=%u hook_period=%u\r\n",
+           (unsigned)CONCURRENCY_PROOF_RUNS,
+           (unsigned)CONCURRENCY_PROOF_WARMUP,
+           (unsigned)CONCURRENCY_PROOF_HOOK_PERIOD_IMAGES);
+
+    for (uint32_t run = 0u; run < CONCURRENCY_PROOF_RUNS; ++run) {
+        uint64_t pl_dma_cycles = 0u;
+        uint64_t pl_kernel_cycles = 0u;
+        uint64_t pl_only_cycles;
+        uint64_t ps_only_cycles = 0u;
+        uint64_t par_dma_cycles = 0u;
+        uint64_t par_kernel_cycles = 0u;
+        uint64_t par_ps_cycles = 0u;
+        uint64_t par_total_cycles = 0u;
+        uint64_t par_pl_cycles = 0u;
+        XTime t_par_start;
+        XTime t_par_end;
+        proof_poll_ctx_t poll_ctx;
+
+        /* Case A: PL only baseline. */
+        status = svm_run_batch_timed(g_mnist_test_q7_1, g_pl_predictions, n, &pl_dma_cycles, &pl_kernel_cycles);
+        if (status != XST_SUCCESS) {
+            printf("PROOF FAIL run=%u phase=PL_ONLY status=%d\r\n", (unsigned)run, status);
+            return status;
+        }
+        pl_only_cycles = proof_max_u64(pl_dma_cycles, pl_kernel_cycles);
+
+        /* Case B: PS only baseline. */
+        svm_cpu_quantized_set_progress_hook(NULL, NULL, 1u);
+        status = svm_cpu_quantized_run_batch_timed(g_mnist_test_q7_1, g_cpu_predictions, n, &ps_only_cycles);
+        if (status != XST_SUCCESS) {
+            printf("PROOF FAIL run=%u phase=PS_ONLY status=%d\r\n", (unsigned)run, status);
+            return status;
+        }
+
+        /* Case C: True concurrent launch + PS-side high-frequency PL polling. */
+        poll_ctx.pl_done_cycles = 0u;
+        poll_ctx.pl_done_valid = 0;
+        XTime_GetTime(&t_par_start);
+        status = svm_run_batch_async_start(g_mnist_test_q7_1, g_pl_predictions, n);
+        if (status != XST_SUCCESS) {
+            printf("PROOF FAIL run=%u phase=PAR_START status=%d\r\n", (unsigned)run, status);
+            return status;
+        }
+
+        svm_cpu_quantized_set_progress_hook(proof_pl_poll_hook, &poll_ctx, CONCURRENCY_PROOF_HOOK_PERIOD_IMAGES);
+        status = svm_cpu_quantized_run_batch_timed(g_mnist_test_q7_1, g_cpu_predictions, n, &par_ps_cycles);
+        svm_cpu_quantized_set_progress_hook(NULL, NULL, 1u);
+        if (status != XST_SUCCESS) {
+            uint64_t drain_dma = 0u;
+            uint64_t drain_kernel = 0u;
+            (void)svm_run_batch_async_wait(g_pl_predictions, n, &drain_dma, &drain_kernel);
+            printf("PROOF FAIL run=%u phase=PAR_PS status=%d\r\n", (unsigned)run, status);
+            return status;
+        }
+
+        status = svm_run_batch_async_wait(g_pl_predictions, n, &par_dma_cycles, &par_kernel_cycles);
+        if (status != XST_SUCCESS) {
+            printf("PROOF FAIL run=%u phase=PAR_WAIT status=%d\r\n", (unsigned)run, status);
+            return status;
+        }
+        XTime_GetTime(&t_par_end);
+
+        par_total_cycles = (uint64_t)(t_par_end - t_par_start);
+        par_pl_cycles = (poll_ctx.pl_done_valid != 0)
+                            ? poll_ctx.pl_done_cycles
+                            : proof_max_u64(par_dma_cycles, par_kernel_cycles);
+
+        if (run >= CONCURRENCY_PROOF_WARMUP) {
+            pl_only_us[keep_idx] = proof_cycles_to_us(pl_only_cycles);
+            ps_only_us[keep_idx] = proof_cycles_to_us(ps_only_cycles);
+            par_total_us[keep_idx] = proof_cycles_to_us(par_total_cycles);
+            par_pl_us[keep_idx] = proof_cycles_to_us(par_pl_cycles);
+            par_ps_us[keep_idx] = proof_cycles_to_us(par_ps_cycles);
+            ++keep_idx;
+        }
+
+        printf("PROOF run=%u pl_only_us=%llu ps_only_us=%llu par_total_us=%llu par_pl_us=%llu par_ps_us=%llu latch=%u\r\n",
+               (unsigned)run,
+               (unsigned long long)proof_cycles_to_us(pl_only_cycles),
+               (unsigned long long)proof_cycles_to_us(ps_only_cycles),
+               (unsigned long long)proof_cycles_to_us(par_total_cycles),
+               (unsigned long long)proof_cycles_to_us(par_pl_cycles),
+               (unsigned long long)proof_cycles_to_us(par_ps_cycles),
+               (unsigned)((poll_ctx.pl_done_valid != 0) ? 1u : 0u));
+    }
+
+    if (keep_idx == 0u) {
+        return XST_FAILURE;
+    }
+
+    {
+        const uint64_t med_pl_only_us = proof_median_u64(pl_only_us, keep_idx);
+        const uint64_t med_ps_only_us = proof_median_u64(ps_only_us, keep_idx);
+        const uint64_t med_par_total_us = proof_median_u64(par_total_us, keep_idx);
+        const uint64_t med_par_pl_us = proof_median_u64(par_pl_us, keep_idx);
+        const uint64_t med_par_ps_us = proof_median_u64(par_ps_us, keep_idx);
+        const uint64_t pl_slowdown_x1000 = (med_pl_only_us != 0u) ? ((med_par_pl_us * 1000ull + (med_pl_only_us / 2ull)) / med_pl_only_us) : 0u;
+        const uint64_t ps_slowdown_x1000 = (med_ps_only_us != 0u) ? ((med_par_ps_us * 1000ull + (med_ps_only_us / 2ull)) / med_ps_only_us) : 0u;
+        const uint64_t serial_sum_us = med_pl_only_us + med_ps_only_us;
+        const uint64_t parallel_gain_x1000 = (med_par_total_us != 0u) ? ((serial_sum_us * 1000ull + (med_par_total_us / 2ull)) / med_par_total_us) : 0u;
+        float pl_acc = 0.0f;
+        float ps_acc = 0.0f;
+        uint32_t pl_mis = 0u;
+        uint32_t ps_mis = 0u;
+
+        (void)svm_eval_accuracy_only(g_pl_predictions, g_mnist_ground_truth, n, &pl_acc, &pl_mis);
+        (void)svm_cpu_quantized_eval_accuracy(g_cpu_predictions, g_svm_cpu_ground_truth, n, &ps_acc, &ps_mis);
+
+        printf("PROOF MEDIAN pl_only_us=%llu ps_only_us=%llu par_total_us=%llu par_pl_us=%llu par_ps_us=%llu\r\n",
+               (unsigned long long)med_pl_only_us,
+               (unsigned long long)med_ps_only_us,
+               (unsigned long long)med_par_total_us,
+               (unsigned long long)med_par_pl_us,
+               (unsigned long long)med_par_ps_us);
+        printf("PROOF RATIOS pl_slowdown=%llu.%03llu ps_slowdown=%llu.%03llu serial_over_parallel=%llu.%03llu\r\n",
+               (unsigned long long)(pl_slowdown_x1000 / 1000ull),
+               (unsigned long long)(pl_slowdown_x1000 % 1000ull),
+               (unsigned long long)(ps_slowdown_x1000 / 1000ull),
+               (unsigned long long)(ps_slowdown_x1000 % 1000ull),
+               (unsigned long long)(parallel_gain_x1000 / 1000ull),
+               (unsigned long long)(parallel_gain_x1000 % 1000ull));
+        printf("PROOF ACC pl_mis=%u pl_acc=%u.%06u ps_mis=%u ps_acc=%u.%06u\r\n",
+               (unsigned)pl_mis,
+               (unsigned)((uint32_t)(pl_acc * 1000000.0f + 0.5f) / 1000000u),
+               (unsigned)((uint32_t)(pl_acc * 1000000.0f + 0.5f) % 1000000u),
+               (unsigned)ps_mis,
+               (unsigned)((uint32_t)(ps_acc * 1000000.0f + 0.5f) / 1000000u),
+               (unsigned)((uint32_t)(ps_acc * 1000000.0f + 0.5f) % 1000000u));
+    }
+
+    return XST_SUCCESS;
+}
+#endif
+
 int main(void) {
     int status;
     uint64_t pl_dma_cycles = 0u;
@@ -141,6 +354,15 @@ int main(void) {
         printf("svm_init_hw failed: %d\r\n", status);
         return status;
     }
+
+#if ENABLE_CONCURRENCY_PROOF_TEST
+    status = run_concurrency_proof_test();
+    if (status != XST_SUCCESS) {
+        printf("run_concurrency_proof_test failed: %d\r\n", status);
+        return status;
+    }
+    return 0;
+#endif
 
     /* Phase 2: run PL batch first (serial mode baseline). */
     status = svm_run_batch_timed(g_mnist_test_q7_1,

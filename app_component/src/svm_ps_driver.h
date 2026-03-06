@@ -10,6 +10,19 @@
 int svm_init_hw(void);
 
 /*
+ * Non-blocking async status snapshot for an in-flight PL batch.
+ * - dma_cycles/kernel_cycles are valid only when corresponding done flag is 1.
+ */
+typedef struct {
+    uint8_t mm2s_done;
+    uint8_t s2mm_done;
+    uint8_t ip_done;
+    uint8_t all_done;
+    uint64_t dma_cycles;
+    uint64_t kernel_cycles;
+} svm_pl_async_status_t;
+
+/*
  * Asynchronously launch one PL batch.
  * - in_q7_1: input buffer, size = 784 * n_images bytes.
  * - out_label: output buffer, size = n_images bytes.
@@ -18,6 +31,8 @@ int svm_init_hw(void);
 int svm_run_batch_async_start(const int8_t *in_q7_1,
                               uint8_t *out_label,
                               uint16_t n_images);
+
+int svm_run_batch_async_poll(svm_pl_async_status_t *status);
 
 /*
  * Wait for a previously started async batch and collect timings.

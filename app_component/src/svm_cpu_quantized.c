@@ -145,6 +145,9 @@ static int8_t g_svm_x_val_q1_scratch[SVM_CPU_IMG_SIZE] SVM_CPU_ALIGNED64;
 static int g_svm_test_cache_ready = 0;
 static int g_svm_img_bounds_ready = 0;
 static int g_svm_prepared = 0;
+static svm_cpu_progress_hook_t g_svm_progress_hook = NULL;
+static void *g_svm_progress_hook_user = NULL;
+static uint32_t g_svm_progress_hook_period_images = 1u;
 
 static inline __attribute__((always_inline)) int32_t abs_i32(int32_t v) {
     return (v >= 0) ? v : -v;
@@ -1235,12 +1238,24 @@ int svm_cpu_quantized_prepare(void) {
     return XST_SUCCESS;
 }
 
+void svm_cpu_quantized_set_progress_hook(svm_cpu_progress_hook_t hook,
+                                         void *user,
+                                         uint32_t period_images) {
+    g_svm_progress_hook = hook;
+    g_svm_progress_hook_user = user;
+    g_svm_progress_hook_period_images = (period_images == 0u) ? 1u : period_images;
+}
+
 int __attribute__((hot)) svm_cpu_quantized_run_batch_timed(const int8_t *in_q7_1,
                                                            uint8_t *out_label,
                                                            uint16_t n_images,
                                                            uint64_t *cpu_cycles) {
     const int use_cached_test = (in_q7_1 == g_mnist_test_q7_1) &&
                                 ((uint32_t)n_images <= SVM_CPU_NUM_IMAGES);
+    const svm_cpu_progress_hook_t progress_hook = g_svm_progress_hook;
+    void *progress_hook_user = g_svm_progress_hook_user;
+    const uint32_t progress_hook_period = g_svm_progress_hook_period_images;
+    uint32_t progress_hook_countdown = 0u;
     XTime t_start;
     XTime t_end;
 
@@ -1261,6 +1276,14 @@ int __attribute__((hot)) svm_cpu_quantized_run_batch_timed(const int8_t *in_q7_1
     XTime_GetTime(&t_start);
 
     for (uint32_t img = 0u; img < (uint32_t)n_images; ++img) {
+        if (UNLIKELY(progress_hook != NULL)) {
+            if (progress_hook_countdown == 0u) {
+                progress_hook(img, progress_hook_user);
+                progress_hook_countdown = progress_hook_period;
+            }
+            progress_hook_countdown--;
+        }
+
         const int8_t *x_dense_q1;
         int32_t x_norm2_q;
         int32_t score_q2048 = ((int32_t)g_svm_bias_q1_7) << SVM_CPU_SCORE_BIAS_SHIFT;
