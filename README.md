@@ -30,7 +30,15 @@
 - `app_component/src/lscript.ld`
   - Linker script (includes OCM placement used by hot buffers).
 
-## 3. Runtime Flow (main)
+## 3. Branch Overview
+- [`master`](https://github.com/YuxuanHan0326/SVMClassifier_ZYNQ_PS/tree/master)
+  - Main stable benchmark branch.
+  - Current `main.c` runs one full PL batch on 2601 images, then one full PS batch on the same 2601 images, and reports timing / accuracy / optional PMU counters.
+- [`co_processing_exploration`](https://github.com/YuxuanHan0326/SVMClassifier_ZYNQ_PS/tree/co_processing_exploration)
+  - Experimental branch for PS+PL co-processing.
+  - Contains split scanning, deployment-mode split execution, DMA alignment handling for split buffers, and exploration of whether PS should process a subset of images in parallel with PL.
+
+## 4. Runtime Flow (main)
 - Enable caches:
   - `Xil_ICacheEnable()`
   - `Xil_DCacheEnable()`
@@ -52,7 +60,41 @@
   - `ENABLE_PMU_PROFILING`
   - `ENABLE_PMU_MULTI_CONFIG`
 
-## 4. Timing Definitions
+## 5. PL Inference Flow on PS Side
+- The PS-side PL path lives in `app_component/src/svm_ps_driver.c` and is intentionally minimal: the ARM core acts as the control plane, while the PL IP performs the actual SVM classification.
+- The full control sequence for one PL batch is:
+  1. `svm_init_hw()`
+     - Look up and initialize AXI DMA.
+     - Check that DMA is in simple mode.
+     - Initialize the HLS-generated `svm_classifier_ip` AXI-Lite wrapper.
+     - Disable auto-restart so one `ap_start` maps to one batch.
+  2. `svm_run_batch_async_start(...)`
+     - Validate pointers and batch size.
+     - Compute DMA lengths:
+       - TX / MM2S = `784 * n_images` bytes.
+       - RX / S2MM = `n_images` bytes.
+     - Flush the input buffer and invalidate the output buffer cache lines.
+     - Write `n_images` into the IP control register through AXI-Lite.
+     - Start S2MM first, so early output beats are not dropped.
+     - Record DMA start time.
+     - Start MM2S to stream input images into PL.
+     - Assert `ap_start` and record the kernel timing start.
+  3. `svm_run_batch_async_wait(...)`
+     - Poll three conditions until all are complete:
+       - MM2S no longer busy.
+       - S2MM no longer busy.
+       - `ap_done` is high on the IP control interface.
+     - Latch the first observed completion time for S2MM and for `ap_done`.
+     - Compute:
+       - `T_dma = MM2S start -> S2MM complete`
+       - `T_kernel = ap_start -> ap_done`
+     - Invalidate the output buffer again so the CPU sees fresh DMA data.
+     - Reduce each output byte to `bit0`, which is the final binary label.
+  4. `svm_run_batch_timed(...)`
+     - Convenience wrapper that performs `async_start + async_wait`.
+- In short, the PS does not participate in the SVM math on the PL path. It only configures the IP, launches DMA, handles cache coherency, waits for completion, and converts the returned output bytes into `0/1` labels.
+
+## 6. Timing Definitions
 - PL kernel time:
   - `XSvm_classifier_ip_Start()` to `XSvm_classifier_ip_IsDone()==1`.
 - PL DMA time:
@@ -62,7 +104,7 @@
 - Time conversion:
   - `time_us = cycles * 1e6 / COUNTS_PER_SECOND`.
 
-## 5. Data / Interface Contract (PL path)
+## 7. Data / Interface Contract (PL path)
 - Input image size: 784 bytes (28x28).
 - Batch size used in this app: 2601 images.
 - DMA lengths:
@@ -71,14 +113,14 @@
 - Output parsing:
   - Final label uses bit0 (`out_label[i] &= 0x1u`).
 
-## 6. Build Notes
+## 8. Build Notes
 - Intended build flow: Vitis embedded flow (`empyro.bat` / IDE build).
 - Local syntax check example:
   - `arm-none-eabi-gcc -fsyntax-only ... main.c svm_ps_driver.c svm_cpu_quantized.c`
 - If git reports `dubious ownership`, add safe directory:
   - `git config --global --add safe.directory D:/SVM_Accelerator/SVM_Accelerator_Project`
 
-## 7. Typical UART Output (simplified)
+## 9. Typical UART Output (simplified)
 - `TB_IMAGES=2601`
 - `PL kernel_cycles=... kernel_time_us=...`
 - `PL dma_cycles=... dma_time_us=... images_per_s=...`
@@ -87,11 +129,11 @@
 - `PS_QUANTIZED mismatches=... accuracy=... threshold=0.98 acc_ok=...`
 - Optional PMU lines when profiling is enabled.
 
-## 8. Accuracy Target
+## 10. Accuracy Target
 - `TB_MIN_ACCURACY` is set to `0.98`.
 - `acc_ok=1` when measured accuracy is `>= 0.98`.
 
-## 9. Notes on Async APIs
+## 11. Notes on Async APIs
 - `svm_ps_driver.c` also provides:
   - `svm_run_batch_async_start(...)`
   - `svm_run_batch_async_wait(...)`

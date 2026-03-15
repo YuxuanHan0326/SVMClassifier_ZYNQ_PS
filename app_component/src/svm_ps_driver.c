@@ -19,7 +19,7 @@
 #define SVM_IMG_SIZE_BYTES 784u
 #define SVM_DMA_POLL_TIMEOUT 200000000u
 
-/* Single static driver instances used by the app. */
+/* Single static driver instances shared by the whole bare-metal app. */
 static XAxiDma g_dma;
 static XSvm_classifier_ip g_svm_ip;
 static int g_is_initialized = 0;
@@ -40,6 +40,7 @@ int svm_init_hw(void) {
     int status;
     XAxiDma_Config *dma_cfg;
 
+    /* Resolve and initialize the AXI DMA instance exported by the BSP. */
     dma_cfg = XAxiDma_LookupConfig(XPAR_XAXIDMA_0_BASEADDR);
     if (dma_cfg == NULL) {
         return XST_DEVICE_NOT_FOUND;
@@ -50,15 +51,18 @@ int svm_init_hw(void) {
         return status;
     }
 
+    /* This app only supports simple-mode DMA, not scatter-gather. */
     if (XAxiDma_HasSg(&g_dma) != 0) {
         return XST_FAILURE;
     }
 
+    /* Initialize the HLS-generated AXI-Lite control wrapper. */
     status = XSvm_classifier_ip_Initialize(&g_svm_ip, XPAR_XSVM_CLASSIFIER_IP_0_BASEADDR);
     if (status != XST_SUCCESS) {
         return status;
     }
 
+    /* One explicit ap_start per batch; do not let the IP auto-restart. */
     XSvm_classifier_ip_DisableAutoRestart(&g_svm_ip);
     g_is_initialized = 1;
     return XST_SUCCESS;
@@ -94,6 +98,7 @@ int svm_run_batch_async_start(const int8_t *in_q7_1,
     tx_len = (uint32_t)n_images * SVM_IMG_SIZE_BYTES;
     rx_len = (uint32_t)n_images;
 
+    /* Guard against oversize requests that would exceed DMA hardware limits. */
     if (tx_len > g_dma.TxBdRing.MaxTransferLen) {
         return XST_INVALID_PARAM;
     }
@@ -101,6 +106,11 @@ int svm_run_batch_async_start(const int8_t *in_q7_1,
         return XST_INVALID_PARAM;
     }
 
+    /*
+     * Ensure DDR contents seen by DMA match the CPU view:
+     * - flush TX buffer so MM2S reads current input bytes
+     * - invalidate RX buffer so stale cache lines do not mask DMA output
+     */
     Xil_DCacheFlushRange((INTPTR)in_q7_1, tx_len);
     Xil_DCacheInvalidateRange((INTPTR)out_label, rx_len);
 
@@ -113,12 +123,20 @@ int svm_run_batch_async_start(const int8_t *in_q7_1,
         return status;
     }
 
+    /*
+     * T_dma is measured from MM2S start to S2MM completion. Record the start
+     * timestamp immediately before the input stream is launched.
+     */
     XTime_GetTime(&g_async_t_dma_start);
     status = XAxiDma_SimpleTransfer(&g_dma, (UINTPTR)in_q7_1, tx_len, XAXIDMA_DMA_TO_DEVICE);
     if (status != XST_SUCCESS) {
         return status;
     }
 
+    /*
+     * Kernel-only timing is kept separately as ap_start to ap_done.
+     * The start timestamp is taken right after issuing ap_start.
+     */
     XSvm_classifier_ip_Start(&g_svm_ip);
     XTime_GetTime(&g_async_t_kernel_start);
 
@@ -164,10 +182,12 @@ int svm_run_batch_async_wait(uint8_t *out_label,
 
     /*
      * Poll all three completion conditions:
-     * - MM2S drain
-     * - S2MM receive complete
-     * - IP ap_done
-     * We record individual end timestamps when each event first happens.
+     * - MM2S drain: all input words have left PS-side DMA
+     * - S2MM complete: all output labels have returned from PL
+     * - IP ap_done: the HLS control interface reports kernel completion
+     *
+     * DMA and kernel completion are timestamped independently so the caller
+     * can report both end-to-end stream latency and kernel-only latency.
      */
     while (timeout_cycles > 0u) {
         if (!mm2s_done && (XAxiDma_Busy(&g_dma, XAXIDMA_DMA_TO_DEVICE) == 0u)) {
@@ -226,6 +246,7 @@ int svm_run_batch_timed(const int8_t *in_q7_1,
     *mm2s_to_s2mm_cycles = 0u;
     *kernel_apstart_to_done_cycles = 0u;
 
+    /* Convenience wrapper for the common synchronous "launch then wait" flow. */
     status = svm_run_batch_async_start(in_q7_1, out_label, n_images);
     if (status != XST_SUCCESS) {
         return status;
@@ -250,6 +271,7 @@ int svm_eval_accuracy_only(const uint8_t *pred,
         return XST_SUCCESS;
     }
 
+    /* PL output uses bit0 as the final binary label. */
     for (uint32_t i = 0; i < (uint32_t)n_images; ++i) {
         if ((pred[i] & 0x1u) == (gt[i] & 0x1u)) {
             correct++;
